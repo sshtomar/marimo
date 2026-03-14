@@ -864,6 +864,366 @@ class AnthropicProvider(PydanticProvider["PydanticAnthropic"]):
         return AnthropicVercelAIAdapter
 
 
+class InquiroProvider(PydanticProvider["PydanticOpenAI"]):
+    """Provider for Inquiro API with reasoning token streaming.
+
+    Overrides stream_completion() to bypass pydantic-ai and stream directly
+    from the Inquiro API via httpx SSE, converting delta.reasoning fields
+    into AI SDK v5 ReasoningStart/Delta/End chunks for marimo's chat panel.
+    """
+
+    THINKING_BUDGET_TOKENS = 2048
+
+    def create_provider(self, config: AnyProviderConfig) -> PydanticOpenAI:
+        from pydantic_ai.providers.openai import (
+            OpenAIProvider as PydanticOpenAI,
+        )
+
+        client = self._build_openai_client(config)
+        return PydanticOpenAI(openai_client=client)
+
+    def create_model(self, max_tokens: int) -> Model:
+        from pydantic_ai.models.openai import (
+            OpenAIChatModel,
+            OpenAIModelSettings,
+        )
+
+        return OpenAIChatModel(
+            model_name=self.model,
+            provider=self.provider,
+            settings=OpenAIModelSettings(max_tokens=max_tokens),
+        )
+
+    async def stream_completion(
+        self,
+        messages: list[ServerUIMessage],
+        system_prompt: str,
+        max_tokens: int,
+        additional_tools: list[ToolDefinition],
+        stream_options: Optional[StreamOptions] = None,
+    ) -> StreamingResponse:
+        """Stream from Inquiro API with reasoning token support."""
+        import json
+
+        import httpx
+        from starlette.responses import StreamingResponse
+
+        from pydantic_ai.ui.vercel_ai.response_types import (
+            DoneChunk,
+            ErrorChunk,
+            FinishChunk,
+            FinishStepChunk,
+            ReasoningDeltaChunk,
+            ReasoningEndChunk,
+            ReasoningStartChunk,
+            StartChunk,
+            StartStepChunk,
+            TextDeltaChunk,
+            TextEndChunk,
+            TextStartChunk,
+            ToolInputDeltaChunk,
+            ToolInputStartChunk,
+        )
+
+        openai_messages = self._convert_messages(messages, system_prompt)
+        tools = self._convert_tools(
+            (self.config.tools or []) + additional_tools
+        )
+
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": openai_messages,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": self.THINKING_BUDGET_TOKENS,
+            },
+            "thinking_format": "structured",
+        }
+        if tools:
+            body["tools"] = tools
+
+        base_url = (self.config.base_url or "").rstrip("/")
+        url = f"{base_url}/chat/completions"
+        sdk_version = 5
+
+        async def generate() -> AsyncGenerator[str, None]:
+            reasoning_id = generate_id("reasoning")
+            text_id = generate_id("text")
+            in_reasoning = False
+            in_text = False
+
+            yield _sse(StartChunk(), sdk_version)
+            yield _sse(StartStepChunk(), sdk_version)
+
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(300.0)
+                ) as client:
+                    async with client.stream(
+                        "POST",
+                        url,
+                        json=body,
+                        headers={
+                            "Authorization": f"Bearer {self.config.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                    ) as resp:
+                        if resp.status_code != 200:
+                            error_body = await resp.aread()
+                            yield _sse(
+                                ErrorChunk(
+                                    error_text=error_body.decode(
+                                        errors="replace"
+                                    )
+                                ),
+                                sdk_version,
+                            )
+                            return
+
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[6:]
+                            if payload.strip() == "[DONE]":
+                                break
+
+                            try:
+                                data = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+
+                            choices = data.get("choices", [])
+                            if not choices:
+                                continue
+                            choice = choices[0]
+                            delta = choice.get("delta", {})
+                            finish = choice.get("finish_reason")
+
+                            # Reasoning tokens
+                            reasoning = delta.get("reasoning")
+                            if reasoning is not None:
+                                if not in_reasoning:
+                                    in_reasoning = True
+                                    yield _sse(
+                                        ReasoningStartChunk(id=reasoning_id),
+                                        sdk_version,
+                                    )
+                                yield _sse(
+                                    ReasoningDeltaChunk(
+                                        id=reasoning_id, delta=reasoning
+                                    ),
+                                    sdk_version,
+                                )
+
+                            # Content tokens
+                            content = delta.get("content")
+                            if content is not None:
+                                if in_reasoning:
+                                    in_reasoning = False
+                                    yield _sse(
+                                        ReasoningEndChunk(id=reasoning_id),
+                                        sdk_version,
+                                    )
+                                if not in_text:
+                                    in_text = True
+                                    yield _sse(
+                                        TextStartChunk(id=text_id),
+                                        sdk_version,
+                                    )
+                                yield _sse(
+                                    TextDeltaChunk(id=text_id, delta=content),
+                                    sdk_version,
+                                )
+
+                            # Tool call deltas
+                            tool_calls = delta.get("tool_calls")
+                            if tool_calls:
+                                for tc in tool_calls:
+                                    tc_id = tc.get("id")
+                                    func = tc.get("function", {})
+                                    name = func.get("name")
+                                    args = func.get("arguments", "")
+                                    if tc_id and name:
+                                        yield _sse(
+                                            ToolInputStartChunk(
+                                                tool_call_id=tc_id,
+                                                tool_name=name,
+                                            ),
+                                            sdk_version,
+                                        )
+                                    if args:
+                                        yield _sse(
+                                            ToolInputDeltaChunk(
+                                                tool_call_id=tc_id or "",
+                                                input_text_delta=args,
+                                            ),
+                                            sdk_version,
+                                        )
+
+                            # Finish
+                            if finish:
+                                if in_reasoning:
+                                    yield _sse(
+                                        ReasoningEndChunk(id=reasoning_id),
+                                        sdk_version,
+                                    )
+                                if in_text:
+                                    yield _sse(
+                                        TextEndChunk(id=text_id), sdk_version
+                                    )
+                                reason_map = {
+                                    "stop": "stop",
+                                    "tool_calls": "tool-calls",
+                                    "length": "length",
+                                }
+                                yield _sse(FinishStepChunk(), sdk_version)
+                                yield _sse(
+                                    FinishChunk(
+                                        finish_reason=reason_map.get(
+                                            finish, "other"
+                                        )
+                                    ),
+                                    sdk_version,
+                                )
+                                yield _sse(DoneChunk(), sdk_version)
+                                return
+
+            except httpx.HTTPStatusError as exc:
+                yield _sse(
+                    ErrorChunk(error_text=str(exc)), sdk_version
+                )
+
+            # If stream ended without a finish_reason
+            if in_reasoning:
+                yield _sse(
+                    ReasoningEndChunk(id=reasoning_id), sdk_version
+                )
+            if in_text:
+                yield _sse(TextEndChunk(id=text_id), sdk_version)
+            yield _sse(FinishStepChunk(), sdk_version)
+            yield _sse(
+                FinishChunk(finish_reason="stop"), sdk_version
+            )
+            yield _sse(DoneChunk(), sdk_version)
+
+        return StreamingResponse(
+            generate(),
+            headers={"x-vercel-ai-ui-message-stream": "v1"},
+            media_type="text/event-stream",
+        )
+
+    @staticmethod
+    def _build_openai_client(config: AnyProviderConfig) -> AsyncOpenAI:
+        from openai import AsyncOpenAI
+
+        return AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+
+    @staticmethod
+    def _convert_messages(
+        messages: list[ServerUIMessage], system_prompt: str
+    ) -> list[dict[str, Any]]:
+        """Convert AI SDK UIMessages to OpenAI-compatible dicts."""
+        import json
+
+        result: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            parts = msg.get("parts", [])
+
+            if not parts:
+                content = msg.get("content", "")
+                if content:
+                    result.append({"role": role, "content": str(content)})
+                continue
+
+            text_pieces: list[str] = []
+            for part in parts:
+                ptype = part.get("type", "")
+                if ptype == "text":
+                    text_pieces.append(part.get("text", ""))
+                elif ptype == "tool-invocation":
+                    if text_pieces:
+                        result.append(
+                            {
+                                "role": role,
+                                "content": "\n".join(text_pieces),
+                            }
+                        )
+                        text_pieces = []
+                    args_val = part.get("args", {})
+                    args_str = (
+                        json.dumps(args_val)
+                        if isinstance(args_val, dict)
+                        else str(args_val)
+                    )
+                    result.append(
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": part.get("toolCallId", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": part.get("toolName", ""),
+                                        "arguments": args_str,
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                    result_val = part.get("result", "")
+                    result_str = (
+                        json.dumps(result_val)
+                        if isinstance(result_val, dict)
+                        else str(result_val)
+                    )
+                    result.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": part.get("toolCallId", ""),
+                            "content": result_str,
+                        }
+                    )
+                # Skip reasoning, step-start, file parts
+
+            if text_pieces:
+                result.append(
+                    {"role": role, "content": "\n".join(text_pieces)}
+                )
+
+        return result
+
+    @staticmethod
+    def _convert_tools(
+        tools: list[ToolDefinition],
+    ) -> list[dict[str, Any]]:
+        """Convert ToolDefinitions to OpenAI-compatible tool dicts."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            }
+            for t in tools
+        ]
+
+
+def _sse(chunk: BaseChunk, sdk_version: int) -> str:
+    """Encode a chunk as an SSE data line."""
+    return f"data: {chunk.encode(sdk_version)}\n\n"
+
+
 class BedrockProvider(PydanticProvider["PydanticBedrock"]):
     def setup_credentials(self, config: AnyProviderConfig) -> None:
         # Use profile name if provided, otherwise use API key
@@ -930,6 +1290,10 @@ def get_completion_provider(
         return AzureOpenAIProvider(model_id.model, config)
     elif model_id.provider == "openai":
         return OpenAIProvider(
+            model_id.model, config, [DependencyManager.openai]
+        )
+    elif model_id.provider == "inquiro":
+        return InquiroProvider(
             model_id.model, config, [DependencyManager.openai]
         )
     else:
