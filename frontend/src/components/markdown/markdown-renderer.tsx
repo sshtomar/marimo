@@ -4,8 +4,9 @@ import { EditorView } from "@codemirror/view";
 import { math } from "@streamdown/math";
 import { useAtomValue } from "jotai";
 import { BetweenHorizontalStartIcon } from "lucide-react";
-import { memo, Suspense, useState } from "react";
+import { memo, Suspense, useEffect, useRef, useState } from "react";
 import { Streamdown, type StreamdownProps } from "streamdown";
+import "streamdown/styles.css";
 import { Button, type ButtonProps } from "@/components/ui/button";
 import { maybeAddMarimoImport } from "@/core/cells/add-missing-import";
 import { useCellActions } from "@/core/cells/cells";
@@ -166,15 +167,86 @@ const COMPONENTS: Components = {
   },
 };
 
-export const MarkdownRenderer = memo(({ content }: { content: string }) => {
-  return (
-    <Streamdown
-      components={COMPONENTS}
-      plugins={{ math }}
-      className="mo-markdown-renderer"
-    >
-      {content}
-    </Streamdown>
-  );
-});
+/**
+ * Drip-feeds content word-by-word during streaming so that each React commit
+ * adds at most one word, giving Streamdown a single element to animate per
+ * frame instead of an entire token batch.
+ */
+function useWordBuffer(content: string, isStreaming?: boolean): string {
+  const [displayed, setDisplayed] = useState(content);
+  const targetRef = useRef(content);
+  const intervalRef = useRef<ReturnType<typeof setInterval>>();
+
+  targetRef.current = content;
+
+  useEffect(() => {
+    if (!isStreaming) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = undefined;
+      }
+      setDisplayed(targetRef.current);
+      return;
+    }
+
+    intervalRef.current = setInterval(() => {
+      setDisplayed((prev) => {
+        const target = targetRef.current;
+        if (prev.length >= target.length) {
+          return prev;
+        }
+        let end = prev.length;
+        while (end < target.length && /\s/.test(target[end])) {
+          end++;
+        }
+        while (end < target.length && !/\s/.test(target[end])) {
+          end++;
+        }
+        return target.slice(0, end);
+      });
+    }, 25);
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = undefined;
+      }
+    };
+  }, [isStreaming]);
+
+  if (!isStreaming) {
+    return content;
+  }
+  return displayed;
+}
+
+export const MarkdownRenderer = memo(
+  ({
+    content,
+    isStreaming,
+  }: {
+    content: string;
+    isStreaming?: boolean;
+  }) => {
+    const buffered = useWordBuffer(content, isStreaming);
+
+    return (
+      <Streamdown
+        components={COMPONENTS}
+        plugins={{ math }}
+        className="mo-markdown-renderer"
+        animated={{
+          animation: "blurIn",
+          duration: 200,
+          easing: "ease-out",
+          sep: "word",
+        }}
+        isAnimating={isStreaming}
+        caret={isStreaming ? "block" : undefined}
+      >
+        {buffered}
+      </Streamdown>
+    );
+  },
+);
 MarkdownRenderer.displayName = "MarkdownRenderer";
