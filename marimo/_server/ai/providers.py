@@ -923,6 +923,7 @@ class InquiroProvider(PydanticProvider["PydanticOpenAI"]):
             TextStartChunk,
             ToolInputDeltaChunk,
             ToolInputStartChunk,
+            ToolOutputAvailableChunk,
         )
 
         openai_messages = self._convert_messages(messages, system_prompt)
@@ -1040,6 +1041,19 @@ class InquiroProvider(PydanticProvider["PydanticOpenAI"]):
                             # Tool call deltas
                             tool_calls = delta.get("tool_calls")
                             if tool_calls:
+                                # Close open streams before tool calls
+                                if in_reasoning:
+                                    in_reasoning = False
+                                    yield _sse(
+                                        ReasoningEndChunk(id=reasoning_id),
+                                        sdk_version,
+                                    )
+                                if in_text:
+                                    in_text = False
+                                    yield _sse(
+                                        TextEndChunk(id=text_id),
+                                        sdk_version,
+                                    )
                                 for tc in tool_calls:
                                     tc_id = tc.get("id")
                                     func = tc.get("function", {})
@@ -1061,6 +1075,20 @@ class InquiroProvider(PydanticProvider["PydanticOpenAI"]):
                                             ),
                                             sdk_version,
                                         )
+
+                            # Tool results (custom extension)
+                            tool_results = delta.get("tool_results")
+                            if tool_results:
+                                for tr in tool_results:
+                                    tr_id = tr.get("tool_call_id", "")
+                                    tr_output = tr.get("output", {})
+                                    yield _sse(
+                                        ToolOutputAvailableChunk(
+                                            tool_call_id=tr_id,
+                                            output=tr_output,
+                                        ),
+                                        sdk_version,
+                                    )
 
                             # Finish
                             if finish:
